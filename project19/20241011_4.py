@@ -1,0 +1,121 @@
+import os
+import torch
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+from torchvision.models.segmentation import deeplabv3_resnet50
+from PIL import Image
+import matplotlib.pyplot as plt
+import numpy as np
+
+# 경로 설정
+test_image_dir = 'C:/20241013/test_jpg'
+test_mask_dir = 'C:/20241013/test_mask'
+model_save_path = 'C:/20241013/deeplabv3_model.pth'
+
+# 사용자 정의 데이터셋 클래스
+class CustomDataset(Dataset):
+    def __init__(self, image_dir, mask_dir, transform=None):
+        self.image_dir = image_dir
+        self.mask_dir = mask_dir
+        self.transform = transform
+        self.image_filenames = os.listdir(image_dir)
+        self.mask_filenames = os.listdir(mask_dir)
+
+    def __len__(self):
+        return len(self.image_filenames)
+
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.image_dir, self.image_filenames[idx])
+        mask_path = os.path.join(self.mask_dir, self.mask_filenames[idx])
+
+        # 원본 이미지 크기 가져오기
+        image_original = Image.open(img_path).convert("RGB")
+        mask_original = Image.open(mask_path).convert("L")
+
+        image = image_original
+        mask = mask_original
+
+        # 이미지를 512x512로 리사이즈하여 모델 입력으로 사용
+        if self.transform:
+            image = self.transform(image)
+            mask = transforms.ToTensor()(mask)
+
+        return image, mask, image_original.size, os.path.basename(img_path)  # 원본 이미지 크기 및 파일명 반환
+
+# 데이터 전처리 정의 (512x512로 리사이즈)
+test_transform = transforms.Compose([
+    transforms.Resize((512, 512)),
+    transforms.ToTensor()
+])
+
+# 테스트용 데이터셋
+test_dataset = CustomDataset(test_image_dir, test_mask_dir, transform=test_transform)
+
+# DataLoader 정의
+test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+
+# 모델 로드
+model = deeplabv3_resnet50(weights=None)  # pre-trained 없이 초기화
+model.classifier[4] = torch.nn.Conv2d(256, 2, kernel_size=(1, 1))  # 두 클래스 (원형 + 배경)
+
+# 저장된 모델 가중치 로드 시 strict=False로 설정
+model.load_state_dict(torch.load(model_save_path), strict=False)  # strict=False로 aux_classifier 무시
+model = model.cuda()  # GPU 사용
+model.eval()  # 평가 모드
+
+# IOU 계산 함수
+def calculate_iou(pred_mask, true_mask):
+    # 교집합
+    intersection = np.logical_and(pred_mask, true_mask)
+    # 합집합
+    union = np.logical_or(pred_mask, true_mask)
+    # IOU 계산
+    iou_score = np.sum(intersection) / np.sum(union)
+    return iou_score
+
+# IOU 계산 및 시각화 + 평균 IOU 계산
+def test_and_calculate_iou(model, test_loader):
+    model.eval()  # 평가 모드
+    iou_scores = {'A': [], 'B': [], 'C': []}  # A, B, C에 대한 IOU 저장
+    with torch.no_grad():
+        for i, (images, masks, original_size, filename) in enumerate(test_loader):
+            images = images.cuda()
+
+            # 모델 추론
+            outputs = model(images)['out']
+            predictions = torch.argmax(outputs, dim=1).cpu().numpy()
+
+            # 예측 결과를 원본 크기로 리사이즈
+            prediction_resized = Image.fromarray(predictions[0].astype(np.uint8) * 255)
+            prediction_resized = prediction_resized.resize(original_size, Image.NEAREST)  # 원본 크기
+
+            # 원본 마스크를 numpy 배열로 변환 (리사이즈 전)
+            mask_np = masks.squeeze(0).squeeze(0).cpu().numpy()
+
+            # 예측 마스크와 실제 마스크의 IOU 계산
+            pred_mask_np = np.array(prediction_resized) // 255  # 예측된 마스크를 이진화
+            true_mask_np = mask_np.astype(np.uint8)  # 실제 마스크
+
+            iou = calculate_iou(pred_mask_np, true_mask_np)
+
+            # 이미지 이름에 따라 A, B, C로 분류하여 IOU 저장
+            if filename[0].startswith('A'):  # 첫 번째 값으로 파일명 참조
+                iou_scores['A'].append(iou)
+            elif filename[0].startswith('B'):
+                iou_scores['B'].append(iou)
+            elif filename[0].startswith('C'):
+                iou_scores['C'].append(iou)
+
+            print(f"Image {filename}: IOU = {iou:.4f}")
+
+    # A, B, C별 IOU 평균 계산
+    for key in ['A', 'B', 'C']:
+        if iou_scores[key]:
+            avg_iou = np.mean(iou_scores[key])
+            print(f"Average IOU for {key}: {avg_iou:.4f}")
+        else:
+            print(f"No images for {key} to calculate IOU.")
+
+# 테스트 진행 및 IOU 계산
+test_and_calculate_iou(model, test_loader)
+
